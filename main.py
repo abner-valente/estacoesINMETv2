@@ -65,6 +65,12 @@ def compute_dt_obs(data_db: str, hora_utc: str) -> datetime:
     return dt_utc.astimezone(BR_TZ)
 
 
+def make_id(api_date: str, hora_utc: str, codigo: str) -> str:
+    """Gera o id_dado_inmet no padrão YYYYMMDDHHMM_CODIGO (ex: 202605071300_A709)."""
+    date_part = datetime.strptime(api_date, "%Y-%m-%d").strftime("%Y%m%d")
+    return f"{date_part}{hora_utc}_{codigo}"
+
+
 def api_rec_to_db_row(api_rec: dict) -> dict:
     """
     Converte um registro da API para o dicionário com os nomes das colunas
@@ -72,14 +78,16 @@ def api_rec_to_db_row(api_rec: dict) -> dict:
     """
     data_db  = api_date_to_db(api_rec["DT_MEDICAO"])
     hora_utc = api_rec["HR_MEDICAO"]
+    codigo   = api_rec["CD_ESTACAO"]
     dt_obs   = compute_dt_obs(data_db, hora_utc)
     lat      = float(api_rec["VL_LATITUDE"])
     lon      = float(api_rec["VL_LONGITUDE"])
 
     row = {
+        "id_dado_inmet": make_id(api_rec["DT_MEDICAO"], hora_utc, codigo),
         "data":      data_db,
         "hora_utc":  hora_utc,
-        "codigo":    api_rec["CD_ESTACAO"],
+        "codigo":    codigo,
         "nome":      api_rec["DC_NOME"],
         "latitude":  lat,
         "longitude": lon,
