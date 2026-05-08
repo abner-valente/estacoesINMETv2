@@ -14,7 +14,7 @@ DB_CONNSTR = (
 API_TOKEN = os.getenv("INMET_API_TOKEN")
 API_BASE_URL = os.getenv("INMET_API_BASE_URL", "https://apitempo.inmet.gov.br/token/estacao")
 
-DB_TABLE = os.getenv("DB_TABLE", "schema.inmet_dados")
+DB_TABLE = os.getenv("DB_TABLE", "public.tb_inmet_ms_geo")
 
 # Mapeamento campos API → colunas do banco
 FIELD_MAP = {

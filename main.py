@@ -2,7 +2,7 @@
 Sincronizador INMET API → banco de dados.
 
 Chave de identificação de um registro: (codigo, data, hora_utc)
-  - data     : string "DD/MM/YYYY"
+  - data     : tipo DATE (PostgreSQL)
   - hora_utc : string "HHMM" (ex: "1800")
 
 Lógica:
@@ -16,9 +16,9 @@ import requests
 import psycopg
 from datetime import datetime, timezone, timedelta
 
-from config import DB_CONNSTR, API_TOKEN, API_BASE_URL, DB_TABLE, FIELD_MAP
+TZ_MINUS4 = timezone(timedelta(hours=-4))
 
-BR_TZ = timezone(timedelta(hours=-4))
+from config import DB_CONNSTR, API_TOKEN, API_BASE_URL, DB_TABLE, FIELD_MAP
 
 
 # ---------------------------------------------------------------------------
@@ -49,20 +49,10 @@ def is_null_record(api_rec: dict) -> bool:
 # Conversão de formatos
 # ---------------------------------------------------------------------------
 
-def api_date_to_db(api_date: str) -> str:
-    """Converte "YYYY-MM-DD" (API) → "DD/MM/YYYY" (banco)."""
-    return datetime.strptime(api_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+def api_date_to_db(api_date: str):
+    """Converte "YYYY-MM-DD" (API) → objeto date do Python (coluna DATE no banco)."""
+    return datetime.strptime(api_date, "%Y-%m-%d").date()
 
-
-def compute_dt_obs(data_db: str, hora_utc: str) -> datetime:
-    """
-    Constrói o datetime local (UTC-4) a partir de data "DD/MM/YYYY"
-    e hora UTC "HHMM".
-    """
-    d = datetime.strptime(data_db, "%d/%m/%Y")
-    h, m = int(hora_utc[:2]), int(hora_utc[2:])
-    dt_utc = datetime(d.year, d.month, d.day, h, m, tzinfo=timezone.utc)
-    return dt_utc.astimezone(BR_TZ)
 
 
 def make_id(api_date: str, hora_utc: str, codigo: str) -> str:
@@ -77,23 +67,27 @@ def api_rec_to_db_row(api_rec: dict) -> dict:
     do banco. Inclui todos os campos necessários para INSERT.
     """
     data_db  = api_date_to_db(api_rec["DT_MEDICAO"])
-    hora_utc = api_rec["HR_MEDICAO"]
-    codigo   = api_rec["CD_ESTACAO"]
-    dt_obs   = compute_dt_obs(data_db, hora_utc)
-    lat      = float(api_rec["VL_LATITUDE"])
-    lon      = float(api_rec["VL_LONGITUDE"])
+    hora_utc_str = api_rec["HR_MEDICAO"]          # "1400" — usado no id e na chave
+    hora_utc_int = int(hora_utc_str)              # 1400  — tipo real da coluna no banco
+    codigo       = api_rec["CD_ESTACAO"]
+    lat          = float(api_rec["VL_LATITUDE"])
+    lon          = float(api_rec["VL_LONGITUDE"])
+
+    h = hora_utc_int // 100
+    m = hora_utc_int % 100
+    data_hora_obs_utc = datetime(data_db.year, data_db.month, data_db.day, h, m, 0,
+                                 tzinfo=TZ_MINUS4)
 
     row = {
-        "id_dado_inmet": make_id(api_rec["DT_MEDICAO"], hora_utc, codigo),
-        "data":      data_db,
-        "hora_utc":  hora_utc,
+        "id_dado_inmet":     make_id(api_rec["DT_MEDICAO"], hora_utc_str, codigo),
+        "data":              data_db,
+        "hora_utc":          hora_utc_int,
+        "data_hora_obs_utc": data_hora_obs_utc,
         "codigo":    codigo,
         "nome":      api_rec["DC_NOME"],
         "latitude":  lat,
         "longitude": lon,
-        "dt_obs":    dt_obs,
-        "dt":        dt_obs,
-        # geometry calculada no SQL via ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+        # geom calculada no SQL via ST_SetSRID(ST_MakePoint(lon, lat), 4326)
     }
 
     for api_field, db_col in FIELD_MAP.items():
@@ -114,24 +108,21 @@ def get_db_records(conn, codigo: str, data_ini: str, data_fim: str) -> dict:
 
     data_ini / data_fim no formato "YYYY-MM-DD".
     """
-    d_ini  = api_date_to_db(data_ini)
-    d_fim  = api_date_to_db(data_fim)
-    dt_ini = compute_dt_obs(d_ini, "0000")
-    dt_fim = compute_dt_obs(d_fim, "0000")
+    d_ini = datetime.strptime(data_ini, "%Y-%m-%d").date()
+    d_fim = datetime.strptime(data_fim, "%Y-%m-%d").date()
 
     sql = f"""
         SELECT data, hora_utc,
                {', '.join(FIELD_MAP.values())}
         FROM {DB_TABLE}
         WHERE codigo = %s
-          AND dt_obs >= %s
-          AND dt_obs <  %s + INTERVAL '1 day'
+          AND data BETWEEN %s AND %s
         ORDER BY data, hora_utc
     """
 
     result = {}
     with conn.cursor() as cur:
-        cur.execute(sql, (codigo, dt_ini, dt_fim))
+        cur.execute(sql, (codigo, d_ini, d_fim))
         cols = [desc[0] for desc in cur.description]
         for row in cur.fetchall():
             rec = dict(zip(cols, row))
@@ -154,7 +145,7 @@ def update_record(conn, row: dict, existing: dict) -> bool:
         return False
 
     set_clause = ", ".join(f"{col} = %s" for col in diffs)
-    values = list(diffs.values()) + [row["codigo"], row["data"], row["hora_utc"]]
+    values = list(diffs.values()) + [row["codigo"], row["data"], int(row["hora_utc"])]
     sql = f"""
         UPDATE {DB_TABLE}
         SET {set_clause}
@@ -162,16 +153,20 @@ def update_record(conn, row: dict, existing: dict) -> bool:
     """
     with conn.cursor() as cur:
         cur.execute(sql, values)
+        if cur.rowcount == 0:
+            print(f"  [AVISO] UPDATE executado mas nenhuma linha foi afetada: "
+                  f"{row['codigo']} {row['data']} {row['hora_utc']}")
+            return False
     return True
 
 
 def insert_record(conn, row: dict):
     """Insere um novo registro no banco."""
-    cols      = list(row.keys()) + ["geometry"]
+    cols      = list(row.keys()) + ["geom"]
     ph_values = ["%s"] * len(row) + ["ST_SetSRID(ST_MakePoint(%s, %s), 4326)"]
     values    = list(row.values()) + [row["longitude"], row["latitude"]]
 
-    sql = f"INSERT INTO {DB_TABLE} ({', '.join(cols)}) VALUES ({', '.join(ph_values)})"
+    sql = f"INSERT INTO {DB_TABLE} ({', '.join(cols)}) VALUES ({', '.join(ph_values)}) ON CONFLICT DO NOTHING"
     with conn.cursor() as cur:
         cur.execute(sql, values)
 
