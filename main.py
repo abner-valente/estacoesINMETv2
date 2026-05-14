@@ -112,7 +112,7 @@ def get_db_records(conn, codigo: str, data_ini: str, data_fim: str) -> dict:
     d_fim = datetime.strptime(data_fim, "%Y-%m-%d").date()
 
     sql = f"""
-        SELECT data, hora_utc,
+        SELECT data, hora_utc, id_dado_inmet, data_hora_obs_utc,
                {', '.join(FIELD_MAP.values())}
         FROM {DB_TABLE}
         WHERE codigo = %s
@@ -133,6 +133,8 @@ def get_db_records(conn, codigo: str, data_ini: str, data_fim: str) -> dict:
 def update_record(conn, row: dict, existing: dict) -> bool:
     """Atualiza apenas os campos que diferem entre API e banco."""
     diffs = {}
+
+    # Campos meteorológicos
     for db_col in FIELD_MAP.values():
         api_val = row.get(db_col)
         db_val  = existing.get(db_col)
@@ -140,6 +142,13 @@ def update_record(conn, row: dict, existing: dict) -> bool:
         db_f  = float(db_val)  if db_val  is not None else None
         if api_f != db_f:
             diffs[db_col] = api_val
+
+    # Campos de identificação/timestamp que podem estar NULL em registros antigos
+    if existing.get("id_dado_inmet") is None:
+        diffs["id_dado_inmet"] = row["id_dado_inmet"]
+
+    if existing.get("data_hora_obs_utc") is None:
+        diffs["data_hora_obs_utc"] = row["data_hora_obs_utc"]
 
     if not diffs:
         return False
