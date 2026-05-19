@@ -16,6 +16,7 @@ import csv
 import json
 import time
 import logging
+import argparse
 import requests
 import psycopg
 import openpyxl
@@ -23,7 +24,7 @@ from openpyxl.cell import Cell
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.worksheet.worksheet import Worksheet
 from typing import Any
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 
 TZ_MINUS4 = timezone(timedelta(hours=-4))
@@ -551,22 +552,51 @@ def save_resumo(
     log.info("Resumo salvo → %s", path)
 
 
-def main():
-    log_dir    = setup_logging()
-    ts_inicio  = datetime.now()
+FORMAT_MAP = {"json": "1", "csv": "2", "xlsx": "3"}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Sincronizador INMET → Banco de Dados",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--modo", choices=["estacao", "lista"],
+        help="Modo de operação:\n  estacao — uma estação\n  lista   — todas do arquivo codigos_estacoes_ms.txt",
+    )
+    parser.add_argument("--codigo", help="Código da estação (obrigatório se --modo estacao)")
+    parser.add_argument("--data-ini", dest="data_ini", help="Data inicial YYYY-MM-DD")
+    parser.add_argument("--data-fim", dest="data_fim", help="Data final   YYYY-MM-DD")
+    parser.add_argument(
+        "--dias-atras", dest="dias_atras", type=int, default=3,
+        help="Calcula data_ini = hoje - N dias, data_fim = hoje (padrão: 3).\nIgnorado se --data-ini/--data-fim forem informados.",
+    )
+    parser.add_argument(
+        "--formato", choices=["json", "csv", "xlsx"], default="xlsx",
+        help="Formato do arquivo de resumo (padrão: xlsx)",
+    )
+    return parser.parse_args()
+
+
+def resolve_dates(args: argparse.Namespace) -> tuple[str, str]:
+    """Retorna (data_ini, data_fim) a partir dos args, calculando por dias-atras se necessário."""
+    if args.data_ini and args.data_fim:
+        return args.data_ini, args.data_fim
+    today    = date.today()
+    data_fim = today.strftime("%Y-%m-%d")
+    data_ini = (today - timedelta(days=args.dias_atras)).strftime("%Y-%m-%d")
+    return data_ini, data_fim
+
+
+def run(modo_label: str, data_ini: str, data_fim: str, formato: str, codigo_unico: str = "") -> None:
+    """Executa a sincronização com os parâmetros já resolvidos (usado tanto pelo modo interativo quanto pelo CLI)."""
+    log_dir   = setup_logging()
+    ts_inicio = datetime.now()
 
     log.info("=" * 50)
     log.info("  Sincronizador INMET → Banco de Dados")
     log.info("=" * 50)
-
-    modo = input_mode()
-    modo_label = "unica_estacao" if modo == "1" else "lista"
-
-    data_ini = input_date("Data inicial (YYYY-MM-DD): ")
-    data_fim = input_date("Data final   (YYYY-MM-DD): ")
-    formato  = input_formato()
-
-    log.info("Modo=%s  data_ini=%s  data_fim=%s", modo_label, data_ini, data_fim)
+    log.info("Modo=%s  data_ini=%s  data_fim=%s  formato=%s", modo_label, data_ini, data_fim, formato)
 
     estacoes_resumo: list[dict] = []
 
@@ -574,17 +604,15 @@ def main():
     with psycopg.connect(DB_CONNSTR) as conn:
         log.info("Conexão estabelecida com sucesso.")
 
-        if modo == "1":
-            codigo = input("Código da estação (ex: A702): ").strip().upper()
-            log.info("Estação informada: %s", codigo)
+        if modo_label == "unica_estacao":
+            log.info("Estação informada: %s", codigo_unico)
             try:
-                stats = sync_estacao(conn, codigo, data_ini, data_fim)
-                estacoes_resumo.append({"codigo": codigo, "status": "ok", **stats})
+                stats = sync_estacao(conn, codigo_unico, data_ini, data_fim)
+                estacoes_resumo.append({"codigo": codigo_unico, "status": "ok", **stats})
             except Exception as e:
-                log.error("Falha na estação %s: %s", codigo, e)
-                estacoes_resumo.append({"codigo": codigo, "status": "erro", "erro": str(e),
+                log.error("Falha na estação %s: %s", codigo_unico, e)
+                estacoes_resumo.append({"codigo": codigo_unico, "status": "erro", "erro": str(e),
                                         "inseridos": 0, "atualizados": 0, "ignorados": 0})
-
         else:
             codigos = load_codigos()
             total   = len(codigos)
@@ -610,8 +638,34 @@ def main():
             if erros:
                 log.warning("Estações com erro: %s", ", ".join(erros))
 
-    save_resumo(log_dir, ts_inicio, modo_label, data_ini, data_fim, estacoes_resumo, formato)
+    save_resumo(log_dir, ts_inicio, modo_label, data_ini, data_fim, estacoes_resumo, FORMAT_MAP[formato])
     log.info("Processo finalizado.")
+
+
+def main() -> None:
+    args = parse_args()
+
+    # ── Modo automático (CLI): todos os parâmetros vieram por argumento ──
+    if args.modo:
+        if args.modo == "estacao" and not args.codigo:
+            print("Erro: --codigo é obrigatório quando --modo estacao.")
+            sys.exit(1)
+        data_ini, data_fim = resolve_dates(args)
+        modo_label = "unica_estacao" if args.modo == "estacao" else "lista"
+        run(modo_label, data_ini, data_fim, args.formato, codigo_unico=args.codigo or "")
+
+    # ── Modo interativo: sem argumentos, pede input ao usuário ──
+    else:
+        setup_logging()
+        modo       = input_mode()
+        modo_label = "unica_estacao" if modo == "1" else "lista"
+        data_ini   = input_date("Data inicial (YYYY-MM-DD): ")
+        data_fim   = input_date("Data final   (YYYY-MM-DD): ")
+        formato    = input_formato()
+        codigo_unico = ""
+        if modo == "1":
+            codigo_unico = input("Código da estação (ex: A702): ").strip().upper()
+        run(modo_label, data_ini, data_fim, {"1": "json", "2": "csv", "3": "xlsx"}[formato], codigo_unico)
 
 
 if __name__ == "__main__":
